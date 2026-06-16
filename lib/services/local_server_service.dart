@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:convert';
+import 'dart:math';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:path/path.dart' as p;
@@ -13,6 +14,15 @@ class LocalServerService {
   HttpServer? _server;
   final DBHelper _dbHelper = DBHelper();
 
+  late final String _secureToken = _generateSecureToken();
+  String get secureToken => _secureToken;
+
+  String _generateSecureToken() {
+    final random = Random.secure();
+    final values = List<int>.generate(16, (i) => random.nextInt(256));
+    return base64Url.encode(values).replaceAll('=', '').replaceAll('-', '').replaceAll('_', '');
+  }
+
   bool get isRunning => _server != null;
 
   Future<void> start() async {
@@ -21,11 +31,12 @@ class LocalServerService {
     var handler = const Pipeline()
         .addMiddleware(logRequests())
         .addMiddleware(_addCorsHeaders())
+        .addMiddleware(_verifySecureToken())
         .addHandler(_handleRequest);
 
     try {
-      _server = await shelf_io.serve(handler, 'localhost', 9000);
-      print('Local Outpost Server running on http://localhost:9000');
+      _server = await shelf_io.serve(handler, InternetAddress.loopbackIPv4, 9000);
+      print('Local Outpost Server running on http://127.0.0.1:9000');
     } catch (e) {
       print('Failed to start local server: $e');
     }
@@ -57,40 +68,84 @@ class LocalServerService {
     };
   }
 
+  Middleware _verifySecureToken() {
+    return (Handler innerHandler) {
+      return (Request request) async {
+        final userAgent = request.headers['user-agent'] ?? '';
+        bool isAuthorized = userAgent.contains(_secureToken);
+
+        // Fallback for native Android media players which request video/audio/images
+        if (!isAuthorized) {
+          final uaLower = userAgent.toLowerCase();
+          if (uaLower.contains('stagefright') ||
+              uaLower.contains('exoplayer') ||
+              uaLower.contains('mediaplayer') ||
+              uaLower.contains('dalvik') ||
+              uaLower.contains('android')) {
+            final path = request.url.path.toLowerCase();
+            final isMediaRequest = request.headers.containsKey('range') ||
+                path.endsWith('.mp4') ||
+                path.endsWith('.mp3') ||
+                path.endsWith('.m4a') ||
+                path.endsWith('.png') ||
+                path.endsWith('.jpg') ||
+                path.endsWith('.jpeg') ||
+                path.endsWith('.webp');
+            if (isMediaRequest) {
+              isAuthorized = true;
+            }
+          }
+        }
+
+        if (!isAuthorized) {
+          print('Blocking unauthorized request to local server: ${request.url.path} (UA: $userAgent)');
+          return Response.forbidden('Forbidden: Unauthorized connection');
+        }
+
+        return await innerHandler(request);
+      };
+    };
+  }
+
   Future<Response> _handleRequest(Request request) async {
-    // Normalise request URL path.
+    // Normalise request URL path (include query string for accurate lookup).
     final path = request.url.path;
-    final String lookupPath = '/' + path;
+    final query = request.url.query;
+    final String lookupPath = query.isNotEmpty ? '/' + path + '?' + query : '/' + path;
 
     print('Local server request: $lookupPath');
 
-    // Try to find the resource in DB.
+    // Try to find the resource in DB by exact relative_url match (includes query string).
     var resource = await _dbHelper.getResourceByUrl(lookupPath);
     
-    // Prefix-mismatch fallback lookup (fully module-agnostic suffix matching)
+    // Prefix-mismatch fallback: match by last 2 path segments ONLY if query strings also match.
+    // This prevents all /alllib/api/page?path=X resources collapsing into the same file.
     if (resource == null) {
-      final segments = request.url.pathSegments;
+      final reqUri = Uri.parse(lookupPath);
+      final segments = reqUri.pathSegments;
       if (segments.isNotEmpty) {
         final allPackages = await _dbHelper.getAllPackages();
+        outer:
         for (var pkg in allPackages) {
           final resources = await _dbHelper.getResourcesForPackage(pkg.id);
           for (var res in resources) {
             final resUri = Uri.parse(res.relativeUrl);
+            // Query params must match to avoid false positives (e.g. all api/page?path=X)
+            if (resUri.queryParameters != reqUri.queryParameters) continue;
             if (resUri.pathSegments.length >= 2 && segments.length >= 2) {
               final resSuffix = resUri.pathSegments.sublist(resUri.pathSegments.length - 2).join('/');
               final reqSuffix = segments.sublist(segments.length - 2).join('/');
               if (resSuffix == reqSuffix) {
                 resource = res;
-                break;
+                break outer;
               }
             } else if (resUri.pathSegments.isNotEmpty && segments.isNotEmpty) {
               if (resUri.pathSegments.last == segments.last) {
                 resource = res;
-                break;
+                break outer;
               }
             }
           }
-          if (resource != null) break;
         }
       }
     }

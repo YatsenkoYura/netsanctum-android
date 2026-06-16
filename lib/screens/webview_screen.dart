@@ -8,6 +8,7 @@ import '../database/db_helper.dart';
 import '../models/package_model.dart';
 import '../models/resource_model.dart';
 import '../services/download_service.dart';
+import '../services/local_server_service.dart';
 
 class WebViewScreen extends StatefulWidget {
   final String initialUrl;
@@ -198,6 +199,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
               allowsInlineMediaPlayback: true,
               // Allows localhost requests on older Android versions
               mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
+              userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 NetOutpostSecure/${LocalServerService().secureToken}',
             ),
             onWebViewCreated: (controller) {
               _webViewController = controller;

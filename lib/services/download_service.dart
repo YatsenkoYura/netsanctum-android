@@ -114,10 +114,25 @@ class DownloadService {
       if (cleanPath.startsWith('/')) {
         cleanPath = cleanPath.substring(1);
       }
-      
-      // Strip query parameters
-      final uri = Uri.parse(cleanPath);
-      cleanPath = uri.path;
+
+      // For endpoints like /alllib/api/page?path=alllib/manga/.../file.jpg
+      // extract the `path` query parameter and use it as the real local path.
+      // This ensures each page gets its own unique file rather than all
+      // overwriting the same `alllib/api/page.jpg`.
+      final uri = Uri.parse(resource.relativeUrl);
+      final queryPath = uri.queryParameters['path'];
+      if (queryPath != null && queryPath.isNotEmpty) {
+        cleanPath = queryPath;
+        if (cleanPath.startsWith('/')) {
+          cleanPath = cleanPath.substring(1);
+        }
+      } else {
+        // No path param — just strip the query string and use the url path
+        cleanPath = uri.path;
+        if (cleanPath.startsWith('/')) {
+          cleanPath = cleanPath.substring(1);
+        }
+      }
 
       // Ensure local extension if none exists (fully module-agnostic extension mapper)
       final extension = p.extension(cleanPath);

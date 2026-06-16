@@ -114,7 +114,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   void _openWebView({String? offlineRootUrl}) {
     if (offlineRootUrl != null) {
       // Offline Mode: Load WebView pointing to the local proxy HTTP server
-      final localUrl = 'http://localhost:9000$offlineRootUrl';
+      final localUrl = 'http://127.0.0.1:9000$offlineRootUrl';
       Navigator.of(context).push(
         MaterialPageRoute(
           builder: (context) => WebViewScreen(
