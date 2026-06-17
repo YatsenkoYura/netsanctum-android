@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../database/db_helper.dart';
@@ -40,18 +41,22 @@ class _WebViewScreenState extends State<WebViewScreen> {
   String? _activeDownloadPackageTitle;
   double _activeDownloadProgress = 0.0;
   String _activeDownloadStatus = '';
+  String _activeDownloadSpeed = '';
+  String _activeDownloadRemaining = '';
 
   @override
   void initState() {
     super.initState();
     _loadApiKey();
     _subscribeToDownloads();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   }
 
   @override
   void dispose() {
     _downloadProgressSubscription?.cancel();
     _downloadStatusSubscription?.cancel();
+    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     super.dispose();
   }
 
@@ -70,6 +75,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
           _activeDownloadPackageId = event.packageId;
           _activeDownloadPackageTitle = pkg?.title ?? event.packageId;
           _activeDownloadProgress = event.progress;
+          _activeDownloadSpeed = event.speed;
+          _activeDownloadRemaining = event.remaining;
           _activeDownloadStatus = 'downloading';
         });
       }
@@ -83,6 +90,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
           _activeDownloadPackageTitle = titleStr;
           if (event.status == 'completed' || event.status == 'failed') {
             _activeDownloadStatus = event.status;
+            _activeDownloadSpeed = '';
+            _activeDownloadRemaining = '';
             if (event.status == 'completed') {
               _activeDownloadProgress = 1.0;
               ScaffoldMessenger.of(context).showSnackBar(
@@ -200,6 +209,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
               // Allows localhost requests on older Android versions
               mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
               userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 NetOutpostSecure/${LocalServerService().secureToken}',
+              allowBackgroundAudioPlaying: true,
             ),
             onWebViewCreated: (controller) {
               _webViewController = controller;
@@ -463,6 +473,30 @@ class _WebViewScreenState extends State<WebViewScreen> {
               ),
             ],
           ),
+          if (_activeDownloadStatus == 'downloading' && (_activeDownloadSpeed.isNotEmpty || _activeDownloadRemaining.isNotEmpty)) ...[
+            const SizedBox(height: 6),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                if (_activeDownloadSpeed.isNotEmpty)
+                  Text(
+                    _activeDownloadSpeed,
+                    style: const TextStyle(
+                      color: Color(0xFF94A3B8),
+                      fontSize: 11,
+                    ),
+                  ),
+                if (_activeDownloadRemaining.isNotEmpty)
+                  Text(
+                    _activeDownloadRemaining,
+                    style: const TextStyle(
+                      color: Color(0xFF94A3B8),
+                      fontSize: 11,
+                    ),
+                  ),
+              ],
+            ),
+          ],
         ],
       ),
     );

@@ -3,6 +3,8 @@ import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 import '../database/db_helper.dart';
 import '../models/resource_model.dart';
 import 'storage_helper.dart';
@@ -11,6 +13,8 @@ class DownloadService {
   static final DownloadService _instance = DownloadService._internal();
   factory DownloadService() => _instance;
   DownloadService._internal();
+
+  static const _channel = MethodChannel('com.example.netoutpost/sync');
 
   final Dio _dio = Dio();
   final DBHelper _dbHelper = DBHelper();
@@ -57,6 +61,11 @@ class DownloadService {
       await _dbHelper.updatePackageStatus(packageId, 'failed');
       onStatusUpdate?.call(packageId, 'failed');
       _statusController.add(DownloadStatusEvent(packageId, 'failed'));
+      
+      // Stop native foreground service
+      try {
+        await _channel.invokeMethod('stopService');
+      } catch (_) {}
     } finally {
       _isProcessing = false;
       // Continue to next package
@@ -67,6 +76,25 @@ class DownloadService {
   Future<void> _downloadPackage(String packageId) async {
     final package = await _dbHelper.getPackage(packageId);
     if (package == null) return;
+
+    // Request notification permission if needed
+    try {
+      final status = await Permission.notification.status;
+      if (!status.isGranted) {
+        await Permission.notification.request();
+      }
+    } catch (e) {
+      print('Failed to request notification permission: $e');
+    }
+
+    // Start native foreground service
+    try {
+      await _channel.invokeMethod('startService', {
+        'title': package.title.isNotEmpty ? package.title : 'Syncing Package',
+      });
+    } catch (e) {
+      print('Failed to start foreground service: $e');
+    }
 
     await _dbHelper.updatePackageStatus(packageId, 'downloading', progress: 0.0);
     onStatusUpdate?.call(packageId, 'downloading');
@@ -84,6 +112,10 @@ class DownloadService {
     if (resources.isEmpty) {
       await _dbHelper.updatePackageStatus(packageId, 'completed', progress: 1.0);
       onStatusUpdate?.call(packageId, 'completed');
+      
+      try {
+        await _channel.invokeMethod('stopService');
+      } catch (_) {}
       return;
     }
 
@@ -98,6 +130,31 @@ class DownloadService {
 
     final cancelToken = CancelToken();
     _activeDownloads[packageId] = cancelToken;
+
+    // Speed and remaining time calculation trackers
+    final DateTime startTime = DateTime.now();
+    int bytesFromCompletedFiles = 0;
+    int bytesFromCurrentFile = 0;
+
+    String formatSpeed(double bytesPerSecond) {
+      if (bytesPerSecond >= 1024 * 1024) {
+        return '${(bytesPerSecond / (1024 * 1024)).toStringAsFixed(1)} MB/s';
+      } else if (bytesPerSecond >= 1024) {
+        return '${(bytesPerSecond / 1024).toStringAsFixed(0)} KB/s';
+      } else {
+        return '${bytesPerSecond.toStringAsFixed(0)} B/s';
+      }
+    }
+
+    String formatRemaining(int seconds, int remainingFiles) {
+      if (seconds <= 0) return '$remainingFiles files left';
+      if (seconds < 60) {
+        return '$seconds sec left ($remainingFiles left)';
+      } else {
+        final minutes = seconds ~/ 60;
+        return '$minutes min left ($remainingFiles left)';
+      }
+    }
 
     for (var resource in resources) {
       if (cancelToken.isCancelled) {
@@ -117,8 +174,6 @@ class DownloadService {
 
       // For endpoints like /alllib/api/page?path=alllib/manga/.../file.jpg
       // extract the `path` query parameter and use it as the real local path.
-      // This ensures each page gets its own unique file rather than all
-      // overwriting the same `alllib/api/page.jpg`.
       final uri = Uri.parse(resource.relativeUrl);
       final queryPath = uri.queryParameters['path'];
       if (queryPath != null && queryPath.isNotEmpty) {
@@ -134,7 +189,7 @@ class DownloadService {
         }
       }
 
-      // Ensure local extension if none exists (fully module-agnostic extension mapper)
+      // Ensure local extension if none exists
       final extension = p.extension(cleanPath);
       if (extension.isEmpty) {
         final typeLower = resource.type.toLowerCase();
@@ -160,14 +215,41 @@ class DownloadService {
       bool alreadyDownloaded = await localFile.exists();
 
       if (!alreadyDownloaded) {
-        // Ensure local folders exist
         await localFile.parent.create(recursive: true);
 
         try {
+          bytesFromCurrentFile = 0;
           await _dio.download(
             sourceUrl,
             localFilePath,
             cancelToken: cancelToken,
+            onReceiveProgress: (received, total) {
+              if (received > 0) {
+                bytesFromCurrentFile = received;
+                final totalDownloadedSoFar = bytesFromCompletedFiles + bytesFromCurrentFile;
+                final elapsedSeconds = DateTime.now().difference(startTime).inMilliseconds / 1000.0;
+                
+                if (elapsedSeconds > 0) {
+                  final double bytesPerSecond = totalDownloadedSoFar / elapsedSeconds;
+                  final String speedText = formatSpeed(bytesPerSecond);
+                  
+                  final double avgSecondsPerFile = downloadedCount > 0 ? elapsedSeconds / downloadedCount : elapsedSeconds;
+                  final int remainingFiles = totalResources - downloadedCount;
+                  final int remainingSeconds = (remainingFiles * avgSecondsPerFile).round();
+                  final String remainingText = formatRemaining(remainingSeconds, remainingFiles);
+                  
+                  final progressVal = (downloadedCount + (received / (total > 0 ? total : received))) / totalResources;
+                  final progressPercent = (progressVal * 100).round().clamp(0, 100);
+                  
+                  _channel.invokeMethod('updateProgress', {
+                    'title': package.title.isNotEmpty ? package.title : 'Syncing Package',
+                    'progress': progressPercent,
+                    'speed': speedText,
+                    'remaining': remainingText,
+                  }).catchError((_) {});
+                }
+              }
+            },
             options: Options(
               headers: {
                 if (apiKey.isNotEmpty) ...{
@@ -177,6 +259,11 @@ class DownloadService {
               },
             ),
           );
+
+          if (await localFile.exists()) {
+            bytesFromCompletedFiles += await localFile.length();
+          }
+          bytesFromCurrentFile = 0;
         } catch (e) {
           print('WARNING: Failed to download resource ${resource.relativeUrl}: $e');
           try {
@@ -185,14 +272,17 @@ class DownloadService {
             }
           } catch (_) {}
           
-          // Increment count and progress so we don't get stuck
           downloadedCount++;
           final progress = downloadedCount / totalResources;
           await _dbHelper.updatePackageStatus(packageId, 'downloading', progress: progress);
           onProgressUpdate?.call(packageId, progress);
-          _progressController.add(DownloadProgressEvent(packageId, progress));
+          _progressController.add(DownloadProgressEvent(packageId, progress, speed: '', remaining: ''));
           continue;
         }
+      } else {
+        try {
+          bytesFromCompletedFiles += await localFile.length();
+        } catch (_) {}
       }
 
       // Update database with the local path
@@ -209,13 +299,43 @@ class DownloadService {
       final progress = downloadedCount / totalResources;
       await _dbHelper.updatePackageStatus(packageId, 'downloading', progress: progress);
       onProgressUpdate?.call(packageId, progress);
-      _progressController.add(DownloadProgressEvent(packageId, progress));
+
+      // Notify progress update with speed and remaining text
+      final elapsedSeconds = DateTime.now().difference(startTime).inMilliseconds / 1000.0;
+      final double bytesPerSecond = elapsedSeconds > 0 ? bytesFromCompletedFiles / elapsedSeconds : 0.0;
+      final String speedText = formatSpeed(bytesPerSecond);
+      final double avgSecondsPerFile = elapsedSeconds / downloadedCount;
+      final int remainingFiles = totalResources - downloadedCount;
+      final int remainingSeconds = (remainingFiles * avgSecondsPerFile).round();
+      final String remainingText = formatRemaining(remainingSeconds, remainingFiles);
+
+      _progressController.add(DownloadProgressEvent(
+        packageId, 
+        progress,
+        speed: speedText,
+        remaining: remainingText,
+      ));
+
+      try {
+        final progressPercent = (progress * 100).round().clamp(0, 100);
+        await _channel.invokeMethod('updateProgress', {
+          'title': package.title.isNotEmpty ? package.title : 'Syncing Package',
+          'progress': progressPercent,
+          'speed': speedText,
+          'remaining': remainingText,
+        });
+      } catch (_) {}
     }
 
     _activeDownloads.remove(packageId);
     await _dbHelper.updatePackageStatus(packageId, 'completed', progress: 1.0);
     onStatusUpdate?.call(packageId, 'completed');
     _statusController.add(DownloadStatusEvent(packageId, 'completed'));
+
+    // Stop native foreground service
+    try {
+      await _channel.invokeMethod('stopService');
+    } catch (_) {}
   }
 
   void cancelDownload(String packageId) {
@@ -227,6 +347,11 @@ class DownloadService {
     _dbHelper.updatePackageStatus(packageId, 'failed');
     onStatusUpdate?.call(packageId, 'failed');
     _statusController.add(DownloadStatusEvent(packageId, 'failed'));
+
+    // Stop native foreground service
+    try {
+      _channel.invokeMethod('stopService');
+    } catch (_) {}
   }
 
   Future<Map<String, String>> _getAppConfig() async {
@@ -245,7 +370,9 @@ class DownloadService {
 class DownloadProgressEvent {
   final String packageId;
   final double progress;
-  DownloadProgressEvent(this.packageId, this.progress);
+  final String speed;
+  final String remaining;
+  DownloadProgressEvent(this.packageId, this.progress, {this.speed = '', this.remaining = ''});
 }
 
 class DownloadStatusEvent {
