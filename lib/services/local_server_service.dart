@@ -5,6 +5,8 @@ import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:path/path.dart' as p;
 import '../database/db_helper.dart';
+import 'storage_helper.dart';
+import 'nsp_reader.dart';
 
 class LocalServerService {
   static final LocalServerService _instance = LocalServerService._internal();
@@ -13,6 +15,8 @@ class LocalServerService {
 
   HttpServer? _server;
   final DBHelper _dbHelper = DBHelper();
+  String? _activePackageId;
+  final Map<String, NspReader> _nspReaders = {};
 
   late final String _secureToken = _generateSecureToken();
   String get secureToken => _secureToken;
@@ -114,6 +118,45 @@ class LocalServerService {
     final String lookupPath = query.isNotEmpty ? '/' + path + '?' + query : '/' + path;
 
     print('Local server request: $lookupPath');
+
+    // 1. Determine active package ID if present in query parameters
+    final String? pkgId = request.url.queryParameters['package_id'];
+    if (pkgId != null && pkgId.isNotEmpty) {
+      _activePackageId = pkgId;
+    }
+
+    // 2. If we have an active package, check if its .nsp container exists and contains the resource
+    if (_activePackageId != null) {
+      try {
+        final appDocDir = await getCacheDirectory();
+        final nspPath = p.join(appDocDir.path, 'offline_cache', '${_activePackageId}.nsp');
+        final nspFile = File(nspPath);
+        if (await nspFile.exists()) {
+          var reader = _nspReaders[_activePackageId!];
+          if (reader == null) {
+            reader = NspReader(nspPath);
+            await reader.init();
+            _nspReaders[_activePackageId!] = reader;
+          }
+
+          if (reader.hasResource(lookupPath)) {
+            final bytes = await reader.getResourceBytes(lookupPath);
+            if (bytes != null) {
+              final mime = reader.getMimeType(lookupPath);
+              return Response.ok(
+                bytes,
+                headers: {
+                  'Content-Type': mime,
+                  'Access-Control-Allow-Origin': '*',
+                },
+              );
+            }
+          }
+        }
+      } catch (e) {
+        print('Error reading from NSP container for $_activePackageId: $e');
+      }
+    }
 
     // Try to find the resource in DB by exact relative_url match (includes query string).
     var resource = await _dbHelper.getResourceByUrl(lookupPath);

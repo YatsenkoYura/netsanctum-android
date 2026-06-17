@@ -209,7 +209,9 @@ class DownloadService {
         }
       }
 
-      final String localFilePath = p.join(offlineCacheDir.path, cleanPath);
+      final String localFilePath = resource.type.toLowerCase() == 'container'
+          ? p.join(offlineCacheDir.path, '${packageId}.nsp')
+          : p.join(offlineCacheDir.path, cleanPath);
       final File localFile = File(localFilePath);
       
       bool alreadyDownloaded = await localFile.exists();
