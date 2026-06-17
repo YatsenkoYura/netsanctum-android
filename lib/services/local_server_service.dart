@@ -158,6 +158,44 @@ class LocalServerService {
       }
     }
 
+    // 2b. Fallback: Check other downloaded .nsp packages for generic resources (like /alllib/dashboard or static assets)
+    try {
+      final appDocDir = await getCacheDirectory();
+      final cacheDir = Directory(p.join(appDocDir.path, 'offline_cache'));
+      if (await cacheDir.exists()) {
+        final entities = cacheDir.listSync();
+        for (var entity in entities) {
+          if (entity is File && entity.path.endsWith('.nsp')) {
+            final pkgIdFromFilename = p.basenameWithoutExtension(entity.path);
+            if (pkgIdFromFilename == _activePackageId) continue;
+
+            var reader = _nspReaders[pkgIdFromFilename];
+            if (reader == null) {
+              reader = NspReader(entity.path);
+              await reader.init();
+              _nspReaders[pkgIdFromFilename] = reader;
+            }
+
+            if (reader.hasResource(lookupPath)) {
+              final bytes = await reader.getResourceBytes(lookupPath);
+              if (bytes != null) {
+                final mime = reader.getMimeType(lookupPath);
+                return Response.ok(
+                  bytes,
+                  headers: {
+                    'Content-Type': mime,
+                    'Access-Control-Allow-Origin': '*',
+                  },
+                );
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      print('Error searching fallback NSP containers: $e');
+    }
+
     // Try to find the resource in DB by exact relative_url match (includes query string).
     var resource = await _dbHelper.getResourceByUrl(lookupPath);
     
