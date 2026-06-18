@@ -49,19 +49,38 @@ class NspReader {
     }
   }
 
+  dynamic _findEntry(String path) {
+    if (_index.containsKey(path)) {
+      return _index[path];
+    }
+
+    // Try normalizations: leading slash and query parameters
+    final reqPathClean = path.contains('?') ? path.split('?')[0] : path;
+    final reqPathNormalized = reqPathClean.startsWith('/') ? reqPathClean : '/$reqPathClean';
+
+    // 1. Check with/without leading slash on the clean path
+    if (_index.containsKey(reqPathClean)) return _index[reqPathClean];
+    if (_index.containsKey(reqPathNormalized)) return _index[reqPathNormalized];
+    final noSlash = reqPathNormalized.substring(1);
+    if (_index.containsKey(noSlash)) return _index[noSlash];
+
+    // 2. Try match by stripping query parameters from index keys
+    for (var key in _index.keys) {
+      final keyClean = key.contains('?') ? key.split('?')[0] : key;
+      final keyNormalized = keyClean.startsWith('/') ? keyClean : '/$keyClean';
+      if (keyNormalized == reqPathNormalized) {
+        return _index[key];
+      }
+    }
+
+    return null;
+  }
+
   /// Get bytes of the file by its virtual path (URL)
   Future<List<int>?> getResourceBytes(String path) async {
     if (!_initialized) await init();
     
-    // Try exact match
-    var entry = _index[path];
-    
-    // Normalization fallback (strip leading slash, query params, etc.)
-    if (entry == null) {
-      final cleanPath = path.contains('?') ? path.split('?')[0] : path;
-      entry = _index[cleanPath] ?? _index['/$cleanPath'] ?? _index[path.replaceFirst('/', '')];
-    }
-
+    final entry = _findEntry(path);
     if (entry == null) return null;
 
     final int offset = entry['offset'];
@@ -79,20 +98,13 @@ class NspReader {
 
   /// Get Content-Type of the file
   String getMimeType(String path) {
-    var entry = _index[path];
-    if (entry == null) {
-      final cleanPath = path.contains('?') ? path.split('?')[0] : path;
-      entry = _index[cleanPath] ?? _index['/$cleanPath'] ?? _index[path.replaceFirst('/', '')];
-    }
+    final entry = _findEntry(path);
     return entry?['mime'] ?? 'application/octet-stream';
   }
 
   /// Check if path exists in the index
   bool hasResource(String path) {
-    final cleanPath = path.contains('?') ? path.split('?')[0] : path;
-    return _index.containsKey(path) || 
-           _index.containsKey(cleanPath) || 
-           _index.containsKey('/$cleanPath') || 
-           _index.containsKey(path.replaceFirst('/', ''));
+    return _findEntry(path) != null;
   }
 }
+

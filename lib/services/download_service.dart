@@ -133,6 +133,7 @@ class DownloadService {
 
     // Speed and remaining time calculation trackers
     final DateTime startTime = DateTime.now();
+    DateTime lastUiUpdateTime = DateTime.now();
     int bytesFromCompletedFiles = 0;
     int bytesFromCurrentFile = 0;
 
@@ -240,7 +241,7 @@ class DownloadService {
                   final int remainingSeconds = (remainingFiles * avgSecondsPerFile).round();
                   final String remainingText = formatRemaining(remainingSeconds, remainingFiles);
                   
-                  final progressVal = (downloadedCount + (received / (total > 0 ? total : received))) / totalResources;
+                  final progressVal = (downloadedCount + (total > 0 ? (received / total) : 0.0)) / totalResources;
                   final progressPercent = (progressVal * 100).round().clamp(0, 100);
                   
                   _channel.invokeMethod('updateProgress', {
@@ -249,6 +250,17 @@ class DownloadService {
                     'speed': speedText,
                     'remaining': remainingText,
                   }).catchError((_) {});
+
+                  final now = DateTime.now();
+                  if (now.difference(lastUiUpdateTime).inMilliseconds > 250) {
+                    lastUiUpdateTime = now;
+                    _progressController.add(DownloadProgressEvent(
+                      packageId,
+                      progressVal,
+                      speed: speedText,
+                      remaining: remainingText,
+                    ));
+                  }
                 }
               }
             },

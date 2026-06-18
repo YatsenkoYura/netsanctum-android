@@ -43,6 +43,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
   String _activeDownloadStatus = '';
   String _activeDownloadSpeed = '';
   String _activeDownloadRemaining = '';
+  bool _isDownloadHudMinimized = false;
 
   @override
   void initState() {
@@ -273,8 +274,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
             Positioned(
               bottom: 16,
               left: 16,
-              right: 16,
-              child: _buildDownloadHUDCard(),
+              right: _isDownloadHudMinimized ? null : 16,
+              child: _isDownloadHudMinimized ? _buildMinimizedHUD() : _buildDownloadHUDCard(),
             ),
         ],
       ),
@@ -436,15 +437,28 @@ class _WebViewScreenState extends State<WebViewScreen> {
               ),
               const SizedBox(width: 8),
               if (_activeDownloadStatus == 'downloading')
-                IconButton(
-                  icon: const Icon(Icons.cancel_outlined, color: Colors.redAccent, size: 20),
-                  onPressed: () {
-                    if (_activeDownloadPackageId != null) {
-                      _downloadService.cancelDownload(_activeDownloadPackageId!);
-                    }
-                  },
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(),
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.keyboard_arrow_down, color: Colors.white70, size: 24),
+                      onPressed: () {
+                        setState(() => _isDownloadHudMinimized = true);
+                      },
+                      padding: const EdgeInsets.only(right: 8),
+                      constraints: const BoxConstraints(),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.cancel_outlined, color: Colors.redAccent, size: 20),
+                      onPressed: () {
+                        if (_activeDownloadPackageId != null) {
+                          _downloadService.cancelDownload(_activeDownloadPackageId!);
+                        }
+                      },
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                    ),
+                  ],
                 ),
             ],
           ),
@@ -498,6 +512,43 @@ class _WebViewScreenState extends State<WebViewScreen> {
             ),
           ],
         ],
+      ),
+    );
+  }
+
+  Widget _buildMinimizedHUD() {
+    return GestureDetector(
+      onTap: () => setState(() => _isDownloadHudMinimized = false),
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1E293B).withValues(alpha: 0.95),
+          shape: BoxShape.circle,
+          border: Border.all(color: const Color(0xFF334155), width: 1.5),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.4),
+              blurRadius: 8,
+              offset: const Offset(0, 4),
+            )
+          ],
+        ),
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            SizedBox(
+              width: 32,
+              height: 32,
+              child: CircularProgressIndicator(
+                value: _activeDownloadProgress,
+                valueColor: const AlwaysStoppedAnimation<Color>(Colors.amber),
+                backgroundColor: const Color(0xFF0F172A),
+                strokeWidth: 3,
+              ),
+            ),
+            const Icon(Icons.cloud_download, color: Colors.amber, size: 16),
+          ],
+        ),
       ),
     );
   }
