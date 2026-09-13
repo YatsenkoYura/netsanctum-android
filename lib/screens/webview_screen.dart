@@ -1,25 +1,31 @@
 import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
+import 'dart:io';
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import '../database/db_helper.dart';
 import '../models/package_model.dart';
 import '../models/resource_model.dart';
+import '../services/credential_store.dart';
 import '../services/download_service.dart';
 import '../services/local_server_service.dart';
+import '../services/session_store.dart';
+import '../services/web_auth_script.dart';
 
 class WebViewScreen extends StatefulWidget {
   final String initialUrl;
+  final String serverUrl;
   final bool isOfflineMode;
 
   const WebViewScreen({
-    Key? key,
+    super.key,
     required this.initialUrl,
+    required this.serverUrl,
     required this.isOfflineMode,
-  }) : super(key: key);
+  });
 
   @override
   State<WebViewScreen> createState() => _WebViewScreenState();
@@ -28,10 +34,13 @@ class WebViewScreen extends StatefulWidget {
 class _WebViewScreenState extends State<WebViewScreen> {
   InAppWebViewController? _webViewController;
   final DBHelper _dbHelper = DBHelper();
+  final CredentialStore _credentialStore = CredentialStore();
   final DownloadService _downloadService = DownloadService();
-  
+  final SessionStore _sessionStore = SessionStore();
+
   double _progress = 0.0;
   String _apiKey = '';
+  bool _configurationLoaded = false;
   bool _isLoading = true;
 
   // Background download status subscriptions and variables
@@ -50,21 +59,32 @@ class _WebViewScreenState extends State<WebViewScreen> {
     super.initState();
     _loadApiKey();
     _subscribeToDownloads();
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    if (Platform.isAndroid) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
   }
 
   @override
   void dispose() {
     _downloadProgressSubscription?.cancel();
     _downloadStatusSubscription?.cancel();
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    if (Platform.isAndroid) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
     super.dispose();
   }
 
   Future<void> _loadApiKey() async {
-    final prefs = await SharedPreferences.getInstance();
+    String apiKey = '';
+    try {
+      apiKey = await _credentialStore.readMasterKey();
+    } catch (e) {
+      debugPrint('Could not read the master key: $e');
+    }
+    if (!mounted) return;
     setState(() {
-      _apiKey = prefs.getString('api_key') ?? '';
+      _apiKey = apiKey;
+      _configurationLoaded = true;
     });
   }
 
@@ -144,6 +164,10 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (!_configurationLoaded) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
     // Inject custom bridge script AT_DOCUMENT_START
     // This defines window.NetOutpostBridge to match the client requirement
     final initialUserScripts = UnmodifiableListView<UserScript>([
@@ -158,6 +182,7 @@ class _WebViewScreenState extends State<WebViewScreen> {
               };
             }
           })();
+          ${buildWebAuthScript(_apiKey, widget.serverUrl)}
         """,
         injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
       ),
@@ -197,7 +222,10 @@ class _WebViewScreenState extends State<WebViewScreen> {
             initialUrlRequest: URLRequest(
               url: WebUri(widget.initialUrl),
               headers: {
-                if (_apiKey.isNotEmpty) 'X-API-Key': _apiKey,
+                if (!widget.isOfflineMode && _apiKey.isNotEmpty) ...{
+                  'X-API-Key': _apiKey,
+                  'Authorization': 'Bearer $_apiKey',
+                },
               },
             ),
             initialUserScripts: initialUserScripts,
@@ -209,7 +237,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
               allowsInlineMediaPlayback: true,
               // Allows localhost requests on older Android versions
               mixedContentMode: MixedContentMode.MIXED_CONTENT_ALWAYS_ALLOW,
-              userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 NetOutpostSecure/${LocalServerService().secureToken}',
+              userAgent:
+                  'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 NetOutpostSecure/${LocalServerService().secureToken}',
               allowBackgroundAudioPlaying: true,
             ),
             onWebViewCreated: (controller) {
@@ -217,34 +246,33 @@ class _WebViewScreenState extends State<WebViewScreen> {
               _setupJavaScriptBridge(controller);
             },
             shouldOverrideUrlLoading: (controller, navigationAction) async {
-              print('WebView redirecting/loading: ${navigationAction.request.url}');
               return NavigationActionPolicy.ALLOW;
             },
             onReceivedServerTrustAuthRequest: (controller, challenge) async {
-              print('WebView SSL Trust Request for: ${challenge.protectionSpace.host}');
               // Allow self-signed certificates for self-hosted media registry
               return ServerTrustAuthResponse(action: ServerTrustAuthResponseAction.PROCEED);
             },
             onConsoleMessage: (controller, consoleMessage) {
-              print('WebView Console [${consoleMessage.messageLevel}]: ${consoleMessage.message}');
+              debugPrint('WebView Console [${consoleMessage.messageLevel}]: ${consoleMessage.message}');
             },
             onReceivedError: (controller, request, error) {
-              print('WebView Error for ${request.url}: ${error.description} (code: ${error.type})');
+              debugPrint('WebView Error for ${request.url}: ${error.description} (code: ${error.type})');
             },
             onReceivedHttpError: (controller, request, errorResponse) {
-              print('WebView HTTP Error for ${request.url}: Status ${errorResponse.statusCode}');
+              debugPrint('WebView HTTP Error for ${request.url}: Status ${errorResponse.statusCode}');
             },
             onLoadStart: (controller, url) {
               setState(() => _isLoading = true);
             },
             onLoadStop: (controller, url) async {
               setState(() => _isLoading = false);
-              // Inject API key into local storage so that API requests inside the webpage can access it
-              if (_apiKey.isNotEmpty) {
-                await controller.evaluateJavascript(source: """
-                  localStorage.setItem('X-API-Key', '$_apiKey');
-                  window.X_API_KEY = '$_apiKey';
-                """);
+              if (!widget.isOfflineMode && url != null) {
+                await _sessionStore.saveLiveUrl(widget.serverUrl, url.toString());
+              }
+            },
+            onUpdateVisitedHistory: (controller, url, isReload) {
+              if (!widget.isOfflineMode && url != null) {
+                unawaited(_sessionStore.saveLiveUrl(widget.serverUrl, url.toString()));
               }
             },
             onProgressChanged: (controller, progress) {
@@ -288,27 +316,70 @@ class _WebViewScreenState extends State<WebViewScreen> {
       callback: (args) async {
         if (args.isEmpty) return;
 
-        print('Bridge message received: $args');
+        debugPrint('Bridge message received: $args');
         try {
           final dynamic rawData = args.first;
           Map<String, dynamic> data;
-          
+
           if (rawData is String) {
             data = jsonDecode(rawData);
           } else if (rawData is Map) {
             data = Map<String, dynamic>.from(rawData);
           } else {
-            print('Bridge Error: Unsupported message type');
+            debugPrint('Bridge Error: Unsupported message type');
             return;
           }
 
           final action = data['action'];
           if (action == 'DOWNLOAD_PACKAGE') {
-            final manifest = data['manifest'];
-            final packageId = manifest['package_id'];
-            final rootUrl = manifest['root_url'];
-            final resourcesList = manifest['resources'] as List<dynamic>;
-            final packageTitle = manifest['package_title'] ?? manifest['title'] ?? manifest['name'] ?? manifest['package_name'] ?? packageId;
+            dynamic manifestData = data['manifest'];
+
+            // If manifest wasn't sent directly, but manifest_url was provided, fetch it
+            if (manifestData == null && data['manifest_url'] != null) {
+              final manifestUrlStr = data['manifest_url'].toString();
+              final fullManifestUrl = widget.serverUrl.endsWith('/') && manifestUrlStr.startsWith('/')
+                  ? widget.serverUrl + manifestUrlStr.substring(1)
+                  : widget.serverUrl + manifestUrlStr;
+
+              final dio = Dio();
+              final response = await dio.get(
+                fullManifestUrl,
+                options: Options(
+                  headers: {
+                    if (_apiKey.isNotEmpty) ...{
+                      'X-API-Key': _apiKey,
+                      'Authorization': 'Bearer $_apiKey',
+                    },
+                  },
+                ),
+              );
+              manifestData = response.data;
+            }
+
+            Map<String, dynamic> manifest;
+            if (manifestData is String) {
+              manifest = jsonDecode(manifestData);
+            } else if (manifestData is Map) {
+              manifest = Map<String, dynamic>.from(manifestData);
+            } else {
+              debugPrint('Bridge Error: manifest is invalid or missing');
+              return;
+            }
+
+            final packageId = manifest['package_id']?.toString() ?? '';
+            if (packageId.isEmpty) {
+              debugPrint('Bridge Error: package_id is missing from manifest');
+              return;
+            }
+
+            final rootUrl = manifest['root_url']?.toString() ?? '';
+            final resourcesList = (manifest['resources'] as List<dynamic>?) ?? [];
+            final packageTitle = (manifest['package_title'] ??
+                    manifest['title'] ??
+                    manifest['name'] ??
+                    manifest['package_name'] ??
+                    packageId)
+                .toString();
 
             // 1. Store Package details with 'pending' state
             final package = PackageModel(
@@ -323,36 +394,42 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
             // 2. Store individual resources to be downloaded
             for (var res in resourcesList) {
-              final resUrl = res['url'] as String;
-              final resType = res['type'] as String;
+              final resMap = res is Map ? res : {};
+              final resUrl = resMap['url']?.toString() ?? '';
+              final resType = resMap['type']?.toString() ?? 'binary';
 
-              final resource = ResourceModel(
-                packageId: packageId,
-                relativeUrl: resUrl,
-                localPath: '', // to be populated on completion
-                type: resType,
-              );
-              await _dbHelper.insertResource(resource);
+              if (resUrl.isNotEmpty) {
+                final resource = ResourceModel(
+                  packageId: packageId,
+                  relativeUrl: resUrl,
+                  localPath: '', // to be populated on completion
+                  type: resType,
+                );
+                await _dbHelper.insertResource(resource);
+              }
             }
 
             // 3. Queue download sequence
             _downloadService.addToQueue(packageId);
 
             // 4. Notify User
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(
-                content: Text('Download of package "$packageId" added to queue.'),
-                backgroundColor: Colors.indigo,
-                duration: const Duration(seconds: 4),
-              ),
-            );
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Download of package "$packageTitle" added to queue.'),
+                  backgroundColor: Colors.indigo,
+                  duration: const Duration(seconds: 4),
+                ),
+              );
+            }
           }
         } catch (e) {
-          print('Bridge Error: failed to process request payload. Exception: $e');
+          debugPrint('Bridge Error: failed to process request payload. Exception: $e');
         }
       },
     );
   }
+
   Widget _buildDownloadHUDCard() {
     Color cardBorderColor = const Color(0xFF334155);
     Color accentColor = Colors.amber;
@@ -373,12 +450,12 @@ class _WebViewScreenState extends State<WebViewScreen> {
 
     return Container(
       decoration: BoxDecoration(
-        color: const Color(0xFF1E293B).withOpacity(0.95), // Slate 800 with slight transparency
+        color: const Color(0xFF1E293B).withValues(alpha: 0.95), // Slate 800 with slight transparency
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: cardBorderColor, width: 1.5),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.4),
+            color: Colors.black.withValues(alpha: 0.4),
             blurRadius: 12,
             offset: const Offset(0, 6),
           )
@@ -487,7 +564,8 @@ class _WebViewScreenState extends State<WebViewScreen> {
               ),
             ],
           ),
-          if (_activeDownloadStatus == 'downloading' && (_activeDownloadSpeed.isNotEmpty || _activeDownloadRemaining.isNotEmpty)) ...[
+          if (_activeDownloadStatus == 'downloading' &&
+              (_activeDownloadSpeed.isNotEmpty || _activeDownloadRemaining.isNotEmpty)) ...[
             const SizedBox(height: 6),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,

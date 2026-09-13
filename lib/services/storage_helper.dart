@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 /// Resolves the root directory where offline packages are saved.
@@ -14,7 +15,7 @@ Future<Directory> getCacheDirectory() async {
         return extDir;
       }
     } catch (e) {
-      print('Failed to get external storage directory, falling back to documents: $e');
+      debugPrint('Failed to get external storage directory, falling back to documents: $e');
     }
   }
   return await getApplicationDocumentsDirectory();

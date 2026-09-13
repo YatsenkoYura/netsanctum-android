@@ -6,16 +6,19 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:intl/intl.dart';
 import '../database/db_helper.dart';
 import '../models/package_model.dart';
+import '../services/credential_store.dart';
 import '../services/download_service.dart';
 import '../services/local_server_service.dart';
+import '../services/session_store.dart';
 import '../services/storage_helper.dart';
+import 'linux_webview_screen.dart';
 import 'webview_screen.dart';
 import 'settings_screen.dart';
 
 const Color slateColor = Color(0xFF94A3B8);
 
 class DashboardScreen extends StatefulWidget {
-  const DashboardScreen({Key? key}) : super(key: key);
+  const DashboardScreen({super.key});
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
@@ -23,14 +26,16 @@ class DashboardScreen extends StatefulWidget {
 
 class _DashboardScreenState extends State<DashboardScreen> {
   final DBHelper _dbHelper = DBHelper();
+  final CredentialStore _credentialStore = CredentialStore();
   final DownloadService _downloadService = DownloadService();
   final LocalServerService _localServer = LocalServerService();
-  
+  final SessionStore _sessionStore = SessionStore();
+
   List<PackageModel> _packages = [];
   bool _isLoading = true;
   String _serverUrl = '';
-  String _apiKey = '';
-  
+  bool _didAutoOpenLiveView = false;
+
   bool _isOnline = false;
   late StreamSubscription<List<ConnectivityResult>> _connectivitySubscription;
 
@@ -55,10 +60,26 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   Future<void> _loadConfig() async {
     final prefs = await SharedPreferences.getInstance();
+    final serverUrl = prefs.getString('server_url') ?? '';
+    String apiKey = '';
+    try {
+      apiKey = await _credentialStore.readMasterKey();
+    } catch (e) {
+      debugPrint('Secure credential storage is unavailable: $e');
+    }
+    if (!mounted) return;
     setState(() {
-      _serverUrl = prefs.getString('server_url') ?? '';
-      _apiKey = prefs.getString('api_key') ?? '';
+      _serverUrl = serverUrl;
     });
+
+    if (!_didAutoOpenLiveView && serverUrl.isNotEmpty && apiKey.isNotEmpty) {
+      _didAutoOpenLiveView = true;
+      final initialUrl = await _sessionStore.restoreLiveUrl(serverUrl);
+      if (!mounted) return;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _openWebView(liveUrl: initialUrl);
+      });
+    }
   }
 
   Future<void> _loadPackages() async {
@@ -111,18 +132,27 @@ class _DashboardScreenState extends State<DashboardScreen> {
     };
   }
 
-  void _openWebView({String? offlineRootUrl}) {
+  void _openWebView({String? offlineRootUrl, String? liveUrl}) {
     if (offlineRootUrl != null) {
       // Offline Mode: Load WebView pointing to the local proxy HTTP server
       final localUrl = 'http://127.0.0.1:9000$offlineRootUrl';
-      Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (context) => WebViewScreen(
-            initialUrl: localUrl,
-            isOfflineMode: true,
-          ),
-        ),
-      ).then((_) => _loadPackages());
+      Navigator.of(context)
+          .push(
+            MaterialPageRoute(
+              builder: (context) => Platform.isLinux
+                  ? LinuxWebViewScreen(
+                      initialUrl: localUrl,
+                      serverUrl: _serverUrl,
+                      isOfflineMode: true,
+                    )
+                  : WebViewScreen(
+                      initialUrl: localUrl,
+                      serverUrl: _serverUrl,
+                      isOfflineMode: true,
+                    ),
+            ),
+          )
+          .then((_) => _loadPackages());
     } else {
       // Online Mode: Load WebView pointing to the remote server
       if (_serverUrl.isEmpty) {
@@ -134,14 +164,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
         );
         return;
       }
-      Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (context) => WebViewScreen(
-            initialUrl: _serverUrl,
-            isOfflineMode: false,
-          ),
-        ),
-      ).then((_) => _loadPackages());
+      Navigator.of(context)
+          .push(
+            MaterialPageRoute(
+              builder: (context) => Platform.isLinux
+                  ? LinuxWebViewScreen(
+                      initialUrl: liveUrl ?? _serverUrl,
+                      serverUrl: _serverUrl,
+                      isOfflineMode: false,
+                    )
+                  : WebViewScreen(
+                      initialUrl: liveUrl ?? _serverUrl,
+                      serverUrl: _serverUrl,
+                      isOfflineMode: false,
+                    ),
+            ),
+          )
+          .then((_) => _loadPackages());
     }
   }
 
@@ -169,9 +208,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     if (confirm == true) {
       await _dbHelper.deletePackage(packageId);
-      // Delete local directory
-      // The local_server has absolute path in resource.local_path, we can get directory from it or from documents directory
-      // We will do clean-up inside _dbHelper but let's also delete folders:
       try {
         final appDocDir = await getCacheDirectory();
         final packageDir = Directory('${appDocDir.path}/packages/$packageId');
@@ -179,13 +215,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
           await packageDir.delete(recursive: true);
         }
       } catch (e) {
-        print('Error deleting package directory: $e');
+        debugPrint('Error deleting package directory: $e');
       }
-      
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Deleted package $packageId')),
-      );
-      _loadPackages();
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Deleted package $packageId')),
+        );
+        _loadPackages();
+      }
     }
   }
 
@@ -224,7 +262,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           displayName = moduleKey[0].toUpperCase() + moduleKey.substring(1);
         }
       }
-      
+
       moduleGroups.add(ModuleGroup(
         name: displayName,
         dashboardUrl: '/$moduleKey/dashboard',
@@ -528,28 +566,29 @@ class _DashboardScreenState extends State<DashboardScreen> {
               style: TextStyle(color: slateColor, fontSize: 10, fontWeight: FontWeight.bold, letterSpacing: 0.8),
             ),
             const SizedBox(height: 6),
-            ...group.completedPackages.map((pkg) => Padding(
-              padding: const EdgeInsets.symmetric(vertical: 4.0),
-              child: Row(
-                children: [
-                  const Icon(Icons.check_circle_outline, color: Colors.teal, size: 14),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      pkg.title,
-                      style: const TextStyle(color: Colors.white, fontSize: 13),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 16),
-                    onPressed: () => _deletePackage(pkg.id),
-                    padding: EdgeInsets.zero,
-                    constraints: const BoxConstraints(),
-                  ),
-                ],
-              ),
-            )).toList(),
+            ...group.completedPackages
+                .map((pkg) => Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4.0),
+                      child: Row(
+                        children: [
+                          const Icon(Icons.check_circle_outline, color: Colors.teal, size: 14),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              pkg.title,
+                              style: const TextStyle(color: Colors.white, fontSize: 13),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          IconButton(
+                            icon: const Icon(Icons.delete_outline, color: Colors.redAccent, size: 16),
+                            onPressed: () => _deletePackage(pkg.id),
+                            padding: EdgeInsets.zero,
+                            constraints: const BoxConstraints(),
+                          ),
+                        ],
+                      ),
+                    )),
             const SizedBox(height: 16),
             SizedBox(
               width: double.infinity,
@@ -583,9 +622,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final isFailed = package.status == 'failed';
 
     Color statusColor = Colors.grey;
-    if (isSyncing) statusColor = Colors.amber;
-    else if (isCompleted) statusColor = Colors.teal;
-    else if (isFailed) statusColor = Colors.redAccent;
+    if (isSyncing) {
+      statusColor = Colors.amber;
+    } else if (isCompleted) {
+      statusColor = Colors.teal;
+    } else if (isFailed) {
+      statusColor = Colors.redAccent;
+    }
 
     // Formatting date
     String formattedDate = '';

@@ -1,6 +1,6 @@
 name: netoutpost
 description: NetOutpost Offline Companion App for NetSanctum.
-version: 1.0.0+1
+version: 1.5.0+7
 
 environment:
   sdk: '>=3.0.0 <4.0.0'
@@ -16,10 +16,12 @@ dependencies:
   path: ^1.9.0
   shelf: ^1.4.1
   connectivity_plus: ^6.0.3
+  crypto: ^3.0.7
   shared_preferences: ^2.2.3
   permission_handler: ^11.3.1
   intl: ^0.19.0
-
+  sqflite_common_ffi: ^2.4.2
+  webview_cef: ^0.6.1
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -27,3 +29,8 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+
+hooks:
+  user_defines:
+    sqlite3:
+      source: system

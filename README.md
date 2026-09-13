@@ -1,6 +1,6 @@
 # NetOutpost: Module-Agnostic Offline Companion App
 
-NetOutpost is a lightweight companion mobile application designed to complement **NetSanctum** (a FastAPI-based self-hosted media registry and downloader).
+NetOutpost is a lightweight Android and Linux desktop companion application designed to complement **NetSanctum** (a FastAPI-based self-hosted media registry and downloader).
 
 It acts as a generic "smart offline browser" with **zero hardcoded UI or business logic** for specific content types (e.g., books, videos, music). Instead, it implements a dynamic runtime shell that intercepts HTTP traffic and serves cached assets locally when offline.
 
@@ -13,6 +13,7 @@ It acts as a generic "smart offline browser" with **zero hardcoded UI or busines
 2. **Synchronisation (JS Bridge)**: The web app posts a standardized JSON **Sync Manifest** to the WebView's JS Bridge containing resource paths to cache. The native Dart layer downloads these files sequentially and registers them in a local SQLite database.
 3. **Offline Mode**: When offline, the WebView is redirected to a local HTTP server running on `http://localhost:9000`. It acts as an interceptor. All API fetches made by the webapp resolve to this local endpoint.
 4. **Partial Content (HTTP 206)**: The local HTTP server supports range-requests for binary media (`type: "binary"` like `.mp4`), enabling smooth video playback, seeking, and scrubbing inside the WebView.
+5. **Desktop Runtime**: Linux uses Chromium Embedded Framework for the WebView and SQLite through FFI while preserving the same bridge and offline proxy contract as Android.
 
 ---
 
@@ -30,7 +31,8 @@ It acts as a generic "smart offline browser" with **zero hardcoded UI or busines
 * `package_id` (TEXT) - Foreign key referencing `packages(id)`.
 * `relative_url` (TEXT) - Intercepted URL relative path (e.g., `/api/novels`).
 * `local_path` (TEXT) - Absolute storage path of downloaded asset.
-* `type` (TEXT) - Resource format type (`json`, `image`, `binary`).
+* `type` (TEXT) - Resource format type (`json`, `image`, `binary`, `container`, `html`, `css`, `js`, `text`).
+* `UNIQUE(package_id, relative_url)` - Prevents duplicate resource entries upon re-sync.
 
 ---
 
@@ -44,14 +46,16 @@ NetSanctum communicates with NetOutpost via the bridge channel:
 ```json
 {
   "action": "DOWNLOAD_PACKAGE",
+  "contract_version": 1,
+  "manifest_url": "/api/video-archiver/videos/123/sync-manifest",
   "manifest": {
+    "schema_version": 1,
     "package_id": "video_123",
-    "root_url": "/video-archiver/dashboard",
+    "package_title": "Sample Video",
+    "root_url": "/video-archiver/dashboard?package_id=video_123",
     "resources": [
-      { "url": "/api/video-archiver/videos", "type": "json" },
-      { "url": "/api/video-archiver/videos/123", "type": "json" },
       { "url": "/api/video-archiver/videos/123/stream", "type": "binary" },
-      { "url": "/api/video-archiver/videos/123/thumbnail", "type": "image" }
+      { "url": "/api/packages/video_123/nsp", "type": "container" }
     ]
   }
 }
@@ -97,11 +101,30 @@ Run from the root of the project:
 flutter pub get
 ```
 
-### 4. Running the App
+### 4. Running on Android
 Ensure a physical Android device or emulator is connected:
 ```bash
-flutter run
+flutter run -d android
 ```
+
+### 5. Running on Linux
+
+Install the standard Flutter Linux toolchain and the system SQLite library. On Arch-based systems:
+
+```bash
+sudo pacman -S clang cmake ninja pkgconf gtk3 sqlite
+```
+
+Then run or build the desktop application:
+
+```bash
+flutter run -d linux
+flutter build linux --release
+```
+
+The first Linux build downloads the CEF runtime and therefore takes longer. The resulting bundle is written under `build/linux/x64/release/bundle/`; keep the whole bundle together when moving the application.
+
+The master API key is stored in a machine-bound encrypted vault on Linux or Android Keystore, not in shared preferences. Linux paste is bridged through GTK for Wayland compatibility; the WebView toolbar also provides a paste button as a fallback.
 
 ---
 

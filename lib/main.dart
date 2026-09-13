@@ -1,13 +1,28 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'package:webview_cef/webview_cef.dart';
+
+import 'services/local_server_service.dart';
 import 'screens/dashboard_screen.dart';
 
-void main() {
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  if (Platform.isLinux) {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+    await WebviewManager().initialize(
+      userAgent: 'NetOutpostDesktop/1.0 NetOutpostSecure/${LocalServerService().secureToken}',
+    );
+  }
+
   runApp(const NetOutpostApp());
 }
 
 class NetOutpostApp extends StatelessWidget {
-  const NetOutpostApp({Key? key}) : super(key: key);
+  const NetOutpostApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -20,7 +35,6 @@ class NetOutpostApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(
           seedColor: Colors.indigo,
           brightness: Brightness.dark,
-          background: const Color(0xFF0F172A), // Slate 900
           surface: const Color(0xFF1E293B), // Slate 800
         ),
         scaffoldBackgroundColor: const Color(0xFF0F172A),

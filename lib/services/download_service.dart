@@ -1,12 +1,15 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
 import '../database/db_helper.dart';
 import '../models/resource_model.dart';
+import 'credential_store.dart';
+import 'local_server_service.dart';
 import 'storage_helper.dart';
 
 class DownloadService {
@@ -18,10 +21,11 @@ class DownloadService {
 
   final Dio _dio = Dio();
   final DBHelper _dbHelper = DBHelper();
-  
+  final CredentialStore _credentialStore = CredentialStore();
+
   // Active downloads map to track progress if needed
   final Map<String, CancelToken> _activeDownloads = {};
-  
+
   // Queue state
   bool _isProcessing = false;
   final List<String> _packageQueue = [];
@@ -42,6 +46,18 @@ class DownloadService {
   Function(String packageId, double progress)? onProgressUpdate;
   Function(String packageId, String status)? onStatusUpdate;
 
+  Future<void> _invokeAndroidSyncService(
+    String method, [
+    Map<String, dynamic>? arguments,
+  ]) async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _channel.invokeMethod(method, arguments);
+    } catch (e) {
+      debugPrint('Android sync service call "$method" failed: $e');
+    }
+  }
+
   void addToQueue(String packageId) {
     if (!_packageQueue.contains(packageId)) {
       _packageQueue.add(packageId);
@@ -57,15 +73,13 @@ class DownloadService {
     try {
       await _downloadPackage(packageId);
     } catch (e) {
-      print('Failed to download package $packageId: $e');
+      debugPrint('Failed to download package $packageId: $e');
       await _dbHelper.updatePackageStatus(packageId, 'failed');
       onStatusUpdate?.call(packageId, 'failed');
       _statusController.add(DownloadStatusEvent(packageId, 'failed'));
-      
+
       // Stop native foreground service
-      try {
-        await _channel.invokeMethod('stopService');
-      } catch (_) {}
+      await _invokeAndroidSyncService('stopService');
     } finally {
       _isProcessing = false;
       // Continue to next package
@@ -78,23 +92,21 @@ class DownloadService {
     if (package == null) return;
 
     // Request notification permission if needed
-    try {
-      final status = await Permission.notification.status;
-      if (!status.isGranted) {
-        await Permission.notification.request();
+    if (Platform.isAndroid) {
+      try {
+        final status = await Permission.notification.status;
+        if (!status.isGranted) {
+          await Permission.notification.request();
+        }
+      } catch (e) {
+        debugPrint('Failed to request notification permission: $e');
       }
-    } catch (e) {
-      print('Failed to request notification permission: $e');
     }
 
     // Start native foreground service
-    try {
-      await _channel.invokeMethod('startService', {
-        'title': package.title.isNotEmpty ? package.title : 'Syncing Package',
-      });
-    } catch (e) {
-      print('Failed to start foreground service: $e');
-    }
+    await _invokeAndroidSyncService('startService', {
+      'title': package.title.isNotEmpty ? package.title : 'Syncing Package',
+    });
 
     await _dbHelper.updatePackageStatus(packageId, 'downloading', progress: 0.0);
     onStatusUpdate?.call(packageId, 'downloading');
@@ -112,15 +124,14 @@ class DownloadService {
     if (resources.isEmpty) {
       await _dbHelper.updatePackageStatus(packageId, 'completed', progress: 1.0);
       onStatusUpdate?.call(packageId, 'completed');
-      
-      try {
-        await _channel.invokeMethod('stopService');
-      } catch (_) {}
+
+      await _invokeAndroidSyncService('stopService');
       return;
     }
 
     final totalResources = resources.length;
     int downloadedCount = 0;
+    int failedCount = 0;
 
     final appDocDir = await getCacheDirectory();
     final offlineCacheDir = Directory(p.join(appDocDir.path, 'offline_cache'));
@@ -167,6 +178,8 @@ class DownloadService {
           ? serverUrl + resource.relativeUrl.substring(1)
           : serverUrl + resource.relativeUrl;
 
+      final isContainer = resource.type.toLowerCase() == 'container' || resource.relativeUrl.endsWith('/nsp');
+
       // Determine local path
       String cleanPath = resource.relativeUrl;
       if (cleanPath.startsWith('/')) {
@@ -192,7 +205,7 @@ class DownloadService {
 
       // Ensure local extension if none exists
       final extension = p.extension(cleanPath);
-      if (extension.isEmpty) {
+      if (extension.isEmpty && !isContainer) {
         final typeLower = resource.type.toLowerCase();
         const typeExtensions = {
           'json': '.json',
@@ -210,11 +223,11 @@ class DownloadService {
         }
       }
 
-      final String localFilePath = resource.type.toLowerCase() == 'container'
-          ? p.join(offlineCacheDir.path, '${packageId}.nsp')
+      final String localFilePath = isContainer
+          ? p.join(offlineCacheDir.path, '$packageId.nsp')
           : p.join(offlineCacheDir.path, cleanPath);
       final File localFile = File(localFilePath);
-      
+
       bool alreadyDownloaded = await localFile.exists();
 
       if (!alreadyDownloaded) {
@@ -231,25 +244,26 @@ class DownloadService {
                 bytesFromCurrentFile = received;
                 final totalDownloadedSoFar = bytesFromCompletedFiles + bytesFromCurrentFile;
                 final elapsedSeconds = DateTime.now().difference(startTime).inMilliseconds / 1000.0;
-                
+
                 if (elapsedSeconds > 0) {
                   final double bytesPerSecond = totalDownloadedSoFar / elapsedSeconds;
                   final String speedText = formatSpeed(bytesPerSecond);
-                  
-                  final double avgSecondsPerFile = downloadedCount > 0 ? elapsedSeconds / downloadedCount : elapsedSeconds;
+
+                  final double avgSecondsPerFile =
+                      downloadedCount > 0 ? elapsedSeconds / downloadedCount : elapsedSeconds;
                   final int remainingFiles = totalResources - downloadedCount;
                   final int remainingSeconds = (remainingFiles * avgSecondsPerFile).round();
                   final String remainingText = formatRemaining(remainingSeconds, remainingFiles);
-                  
+
                   final progressVal = (downloadedCount + (total > 0 ? (received / total) : 0.0)) / totalResources;
                   final progressPercent = (progressVal * 100).round().clamp(0, 100);
-                  
-                  _channel.invokeMethod('updateProgress', {
+
+                  unawaited(_invokeAndroidSyncService('updateProgress', {
                     'title': package.title.isNotEmpty ? package.title : 'Syncing Package',
                     'progress': progressPercent,
                     'speed': speedText,
                     'remaining': remainingText,
-                  }).catchError((_) {});
+                  }));
 
                   final now = DateTime.now();
                   if (now.difference(lastUiUpdateTime).inMilliseconds > 250) {
@@ -279,13 +293,14 @@ class DownloadService {
           }
           bytesFromCurrentFile = 0;
         } catch (e) {
-          print('WARNING: Failed to download resource ${resource.relativeUrl}: $e');
+          debugPrint('WARNING: Failed to download resource ${resource.relativeUrl}: $e');
+          failedCount++;
           try {
             if (await localFile.exists()) {
               await localFile.delete();
             }
           } catch (_) {}
-          
+
           downloadedCount++;
           final progress = downloadedCount / totalResources;
           await _dbHelper.updatePackageStatus(packageId, 'downloading', progress: progress);
@@ -324,32 +339,34 @@ class DownloadService {
       final String remainingText = formatRemaining(remainingSeconds, remainingFiles);
 
       _progressController.add(DownloadProgressEvent(
-        packageId, 
+        packageId,
         progress,
         speed: speedText,
         remaining: remainingText,
       ));
 
-      try {
-        final progressPercent = (progress * 100).round().clamp(0, 100);
-        await _channel.invokeMethod('updateProgress', {
-          'title': package.title.isNotEmpty ? package.title : 'Syncing Package',
-          'progress': progressPercent,
-          'speed': speedText,
-          'remaining': remainingText,
-        });
-      } catch (_) {}
+      final progressPercent = (progress * 100).round().clamp(0, 100);
+      await _invokeAndroidSyncService('updateProgress', {
+        'title': package.title.isNotEmpty ? package.title : 'Syncing Package',
+        'progress': progressPercent,
+        'speed': speedText,
+        'remaining': remainingText,
+      });
     }
 
     _activeDownloads.remove(packageId);
-    await _dbHelper.updatePackageStatus(packageId, 'completed', progress: 1.0);
-    onStatusUpdate?.call(packageId, 'completed');
-    _statusController.add(DownloadStatusEvent(packageId, 'completed'));
+
+    // Invalidate NSP reader cache so new/updated NSP container is re-opened cleanly
+    await LocalServerService().invalidateReader(packageId);
+
+    final finalStatus = failedCount > 0 ? 'failed' : 'completed';
+    final finalProgress = failedCount > 0 ? (downloadedCount - failedCount) / totalResources : 1.0;
+    await _dbHelper.updatePackageStatus(packageId, finalStatus, progress: finalProgress);
+    onStatusUpdate?.call(packageId, finalStatus);
+    _statusController.add(DownloadStatusEvent(packageId, finalStatus));
 
     // Stop native foreground service
-    try {
-      await _channel.invokeMethod('stopService');
-    } catch (_) {}
+    await _invokeAndroidSyncService('stopService');
   }
 
   void cancelDownload(String packageId) {
@@ -363,9 +380,7 @@ class DownloadService {
     _statusController.add(DownloadStatusEvent(packageId, 'failed'));
 
     // Stop native foreground service
-    try {
-      _channel.invokeMethod('stopService');
-    } catch (_) {}
+    unawaited(_invokeAndroidSyncService('stopService'));
   }
 
   Future<Map<String, String>> _getAppConfig() async {
@@ -373,7 +388,7 @@ class DownloadService {
       final prefs = await SharedPreferences.getInstance();
       return {
         'serverUrl': prefs.getString('server_url') ?? '',
-        'apiKey': prefs.getString('api_key') ?? '',
+        'apiKey': await _credentialStore.readMasterKey(),
       };
     } catch (e) {
       return {'serverUrl': '', 'apiKey': ''};

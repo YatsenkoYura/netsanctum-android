@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import '../models/package_model.dart';
 import '../models/resource_model.dart';
+import '../services/local_server_service.dart';
 
 class DBHelper {
   static final DBHelper _instance = DBHelper._internal();
@@ -24,7 +26,10 @@ class DBHelper {
 
     return await openDatabase(
       path,
-      version: 2,
+      version: 3,
+      onConfigure: (db) async {
+        await db.execute('PRAGMA foreign_keys = ON');
+      },
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -49,7 +54,8 @@ class DBHelper {
         relative_url TEXT,
         local_path TEXT,
         type TEXT,
-        FOREIGN KEY (package_id) REFERENCES packages (id) ON DELETE CASCADE
+        FOREIGN KEY (package_id) REFERENCES packages (id) ON DELETE CASCADE,
+        UNIQUE (package_id, relative_url)
       )
     ''');
   }
@@ -59,7 +65,15 @@ class DBHelper {
       try {
         await db.execute('ALTER TABLE packages ADD COLUMN title TEXT');
       } catch (e) {
-        print('Database migration error: $e');
+        debugPrint('Database migration error (v2): $e');
+      }
+    }
+    if (oldVersion < 3) {
+      try {
+        // Create unique index for deduping package resources
+        await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_pkg_res ON resources(package_id, relative_url)');
+      } catch (e) {
+        debugPrint('Database migration error (v3): $e');
       }
     }
   }
@@ -107,6 +121,9 @@ class DBHelper {
 
   Future<void> deletePackage(String id) async {
     final db = await database;
+
+    // Invalidate local server cached reader for this package
+    await LocalServerService().invalidateReader(id);
     
     // 1. Fetch all resources of this package before deleting
     final List<Map<String, dynamic>> resourceMaps = await db.query(
@@ -137,7 +154,7 @@ class DBHelper {
               await file.delete();
             }
           } catch (e) {
-            print('Error deleting unreferenced resource file: $e');
+            debugPrint('Error deleting unreferenced resource file: $e');
           }
         }
       }
@@ -166,7 +183,6 @@ class DBHelper {
 
   Future<ResourceModel?> getResourceByUrl(String relativeUrl) async {
     final db = await database;
-    // Strip trailing slashes or query parameters if needed, but standard URL lookup first
     final List<Map<String, dynamic>> maps = await db.query(
       'resources',
       where: 'relative_url = ?',
